@@ -1,31 +1,20 @@
 ### Syscall Dumper
 
-This project is a simple Windows Util that dumps Nt, Zw & Ke calls relative to your system. (Win10&11)
+A simple tool to aid you with extracting clean SSN's
 
 ### Features:
-- Dumps Nt & Zw calls & their syscall numbers (undocumented included)
-- Dumps Ke (Kernel) mem addresses (cannot be invoked from UM)
-- Built using C++20 and can be compiled with either `clang++` or `Visual Studio` tools.
+- Dumps all SSN's (syscalls) on the system
+- Avoids Usermode hooks by xrefing Exception Dir & mapping to private mem
+- Built using C++20 and can be compiled with either `clang++`
 
 ### Output
-- NtCalls.dat
-- ZwCalls.dat
-- KeAddr.dat
-
-### Compilation:
-The project can be compiled using either **Visual Studio** (via CMake) or **Clang++**. 
+- syscall.dat
 
 ### Steps to Compile:
-
-#### Using Visual Studio (via CMake):
-1. Make sure you have **Visual Studio** installed with **C++ tools** and **CMake** support.
-2. Run the `compile.bat` script in the terminal:
-   - This will auto configure with CMake & output the dumperexe into /exe/
    
 #### Using Clang++:
-1. Ensure you have **Clang++** installed and properly configured.
-2. Run the `compile.bat` script in the terminal:
-   - This will output dumper.exe into the root dir
+1. Ensure you have **Clang++** installed
+2. Run `compile.bat` 
 
 ### License:
 N/A
