@@ -2,30 +2,22 @@
 
 #include <fstream>
 #include <iostream>
+#include <vector>
 #include <string>
-#include <string_view>
 #include <optional>
 #include <format>
-#include <unordered_map>
+#include <algorithm>
+#include <execution>
+#include <stdexcept>
+#include <mutex>
 
 template <typename T>
 constexpr T resolve_rva(const void* base, DWORD rva) noexcept {
     return reinterpret_cast<T>(reinterpret_cast<const BYTE*>(base) + rva);
 }
 
-[[nodiscard]] std::optional<BYTE*> funcAddr(const HMODULE module, const std::string_view func_name) noexcept {
-    auto* func_addr = reinterpret_cast<BYTE*>(GetProcAddress(module, func_name.data()));
-    return func_addr ? std::make_optional(func_addr) : std::nullopt;
-}
-
-[[nodiscard]] constexpr bool isSyscall(const BYTE* bytes, const size_t actual_size = 8) noexcept {
-    return (actual_size >= 8 &&
-            bytes[0] == 0x4C && bytes[1] == 0x8B && bytes[2] == 0xD1 && // mov r10, rcx
-            bytes[3] == 0xB8);                                          // mov eax, <callnum>
-}
-
-[[nodiscard]] constexpr bool VStub(const BYTE* bytes, const size_t max_search_len = 32) noexcept {
-    if (!isSyscall(bytes)) [[unlikely]] {
+[[nodiscard]] constexpr bool isValidSyscall(const BYTE* bytes, const size_t actual_size = 8, const size_t max_search_len = 32) noexcept {
+    if (actual_size < 8 || bytes[0] != 0x4C || bytes[1] != 0x8B || bytes[2] != 0xD1 || bytes[3] != 0xB8) {
         return false;
     }
     for (size_t i = 4; i < max_search_len - 2; ++i) {
@@ -36,86 +28,148 @@ constexpr T resolve_rva(const void* base, DWORD rva) noexcept {
     return false;
 }
 
-[[nodiscard]] constexpr std::optional<DWORD> XtractNum(const BYTE* bytes) noexcept {
-    return (isSyscall(bytes) && VStub(bytes)) ? std::make_optional(*reinterpret_cast<const DWORD*>(bytes + 4))
-                                              : std::nullopt;
-}
-
 std::string get_windows_version() noexcept {
     RTL_OSVERSIONINFOW version_info = { sizeof(RTL_OSVERSIONINFOW) };
     const auto rtl_get_version = reinterpret_cast<NTSTATUS(WINAPI*)(PRTL_OSVERSIONINFOW)>(
         GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion"));
 
     if (rtl_get_version && rtl_get_version(&version_info) == 0) {
-        return std::format("==== {}.{} Build {} ====\n\n", 
-                           version_info.dwMajorVersion, 
-                           version_info.dwMinorVersion, 
+        return std::format("==== Windows Version: {}.{} (Build {}) ====\n\n",
+                           version_info.dwMajorVersion,
+                           version_info.dwMinorVersion,
                            version_info.dwBuildNumber);
     }
     return "==== Unknown Windows Version ====\n\n";
 }
 
-void dump(const std::string_view module_name, const std::string_view prefix, const std::string& output_file, bool resolve_syscalls) noexcept {
-    const auto module = LoadLibraryExW(std::wstring(module_name.begin(), module_name.end()).c_str(), nullptr, DONT_RESOLVE_DLL_REFERENCES);
-    if (!module) [[unlikely]] {
-        std::cerr << "failed to load " << module_name << "\n";
-        return;
+class MappedFile {
+    HANDLE file_handle = nullptr;
+    HANDLE mapping_handle = nullptr;
+    void* mapped_view = nullptr;
+
+public:
+    explicit MappedFile(const std::wstring& path) {
+        file_handle = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file_handle == INVALID_HANDLE_VALUE) {
+            throw std::runtime_error("Failed to open file: " + std::string(path.begin(), path.end()));
+        }
+
+        mapping_handle = CreateFileMappingW(file_handle, nullptr, PAGE_READONLY | SEC_IMAGE, 0, 0, nullptr);
+        if (!mapping_handle) {
+            CloseHandle(file_handle);
+            throw std::runtime_error("Failed to create file mapping: " + std::string(path.begin(), path.end()));
+        }
+
+        mapped_view = MapViewOfFile(mapping_handle, FILE_MAP_READ, 0, 0, 0);
+        if (!mapped_view) {
+            CloseHandle(mapping_handle);
+            CloseHandle(file_handle);
+            throw std::runtime_error("Failed to map file: " + std::string(path.begin(), path.end()));
+        }
     }
 
-    const auto dos_header = reinterpret_cast<const IMAGE_DOS_HEADER*>(module);
-    const auto nt_header = reinterpret_cast<const IMAGE_NT_HEADERS*>(
-        reinterpret_cast<const BYTE*>(module) + dos_header->e_lfanew);
+    ~MappedFile() {
+        if (mapped_view) UnmapViewOfFile(mapped_view);
+        if (mapping_handle) CloseHandle(mapping_handle);
+        if (file_handle) CloseHandle(file_handle);
+    }
 
+    [[nodiscard]] void* get() const noexcept {
+        return mapped_view;
+    }
+};
+
+// dump SSNs from given DLL
+std::vector<std::pair<std::string, DWORD>> dump_ssns_from_dll(const std::wstring& dll_path) {
+    std::vector<std::pair<std::string, DWORD>> ssn_list;
+
+    MappedFile mapped_file(dll_path);
+    void* mapped_dll = mapped_file.get();
+
+    const auto dos_header = reinterpret_cast<const IMAGE_DOS_HEADER*>(mapped_dll);
+    const auto nt_header = resolve_rva<const IMAGE_NT_HEADERS*>(mapped_dll, dos_header->e_lfanew);
     const auto export_dir_rva = nt_header->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
-    const auto export_dir = resolve_rva<const IMAGE_EXPORT_DIRECTORY*>(module, export_dir_rva);
-    const auto name_rvas = resolve_rva<const DWORD*>(module, export_dir->AddressOfNames);
-    const auto func_rvas = resolve_rva<const DWORD*>(module, export_dir->AddressOfFunctions);
-    const auto name_ordinals = resolve_rva<const WORD*>(module, export_dir->AddressOfNameOrdinals);
-
-    std::ofstream output(output_file, std::ios::out);
-    if (!output.is_open()) [[unlikely]] {
-        std::cerr << "failed to open " << output_file << "\n";
-        FreeLibrary(module);
-        return;
-    }
-
-    output << get_windows_version();
+    const auto export_dir = resolve_rva<const IMAGE_EXPORT_DIRECTORY*>(mapped_dll, export_dir_rva);
+    const auto exception_dir_rva = nt_header->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].VirtualAddress;
+    const auto exception_dir_size = nt_header->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].Size;
+    const auto exception_dir = resolve_rva<const RUNTIME_FUNCTION*>(mapped_dll, exception_dir_rva);
+    const auto name_rvas = resolve_rva<const DWORD*>(mapped_dll, export_dir->AddressOfNames);
+    const auto func_rvas = resolve_rva<const DWORD*>(mapped_dll, export_dir->AddressOfFunctions);
+    const auto name_ordinals = resolve_rva<const WORD*>(mapped_dll, export_dir->AddressOfNameOrdinals);
 
     for (size_t i = 0; i < export_dir->NumberOfNames; ++i) {
-        const auto func_name = resolve_rva<const char*>(module, name_rvas[i]);
+        const auto func_name = resolve_rva<const char*>(mapped_dll, name_rvas[i]);
 
-        if (std::string_view(func_name).starts_with(prefix)) {
+        // filter for nt
+        if (std::string_view(func_name).starts_with("Nt")) {
             const auto func_rva = func_rvas[name_ordinals[i]];
-            const auto func_addr = resolve_rva<const void*>(module, func_rva);
+            const auto func_addr = resolve_rva<const BYTE*>(mapped_dll, func_rva);
 
-            if (resolve_syscalls) {
-                const auto func_bytes = funcAddr(module, func_name);
-                if (func_bytes) {
-                    const auto syscall_num = XtractNum(func_bytes.value());
-                    if (syscall_num) {
-                        std::cout << func_name << " :: " << std::hex << syscall_num.value() << "\n";
-                        output << func_name << " :: " << std::hex << syscall_num.value() << "\n";
-                    }
+            // xref w/ exceptions dir
+            bool found_in_exception = false;
+            for (size_t j = 0; j < exception_dir_size / sizeof(RUNTIME_FUNCTION); ++j) {
+                const auto& runtime_func = exception_dir[j];
+                const auto func_start = resolve_rva<const void*>(mapped_dll, runtime_func.BeginAddress);
+                if (func_addr == func_start) {
+                    found_in_exception = true;
+                    break;
                 }
-            } else {
-                std::cout << func_name << " :: " << func_addr << "\n";
-                output << func_name << " :: " << func_addr << "\n";
+            }
+
+            if (found_in_exception && isValidSyscall(func_addr)) {
+                const DWORD ssn = *reinterpret_cast<const DWORD*>(func_addr + 4); // SSN is imm32 in eax
+                ssn_list.emplace_back(func_name, ssn);
             }
         }
     }
 
-    FreeLibrary(module);
+    return ssn_list;
 }
 
-int main() noexcept {
-    std::cout << "made by hatedamon\n";
+void dump_syscalls(const std::vector<std::wstring>& dll_paths, const std::string& output_file) {
+    std::vector<std::pair<std::string, DWORD>> all_ssns;
+    std::mutex ssn_mutex;
 
-    dump("ntoskrnl.exe", "Ke", "KeAddr.dat", false);
-    dump("ntdll.dll", "Nt", "NtCalls.dat", true);
-    dump("ntdll.dll", "Zw", "ZwCalls.dat", true);
+    std::for_each(std::execution::par, dll_paths.begin(), dll_paths.end(), [&](const auto& dll_path) {
+        try {
+            const auto ssns = dump_ssns_from_dll(dll_path);
+            std::scoped_lock lock(ssn_mutex);
+            all_ssns.insert(all_ssns.end(), ssns.begin(), ssns.end());
+        } catch (const std::exception& ex) {
+            std::cerr << "Error processing " << std::string(dll_path.begin(), dll_path.end()) << ": " << ex.what() << "\n";
+        }
+    });
 
-    std::cout << "\ndone :3";
-    std::cin.get();
+    std::sort(all_ssns.begin(), all_ssns.end(), [](const auto& a, const auto& b) {
+        return a.second < b.second;
+    });
+
+    std::ofstream output(output_file, std::ios::out);
+    if (!output.is_open()) {
+        throw std::runtime_error("Failed to open output file");
+    }
+
+    output << get_windows_version();
+
+    for (const auto& [name, ssn] : all_ssns) {
+        output << std::format("{}:: 0x{:X} | {}\n", name, ssn, ssn);
+    }
+}
+
+int main() {
+    try {
+        std::vector<std::wstring> dlls = {
+            L"C:\\Windows\\System32\\ntdll.dll",
+            L"C:\\Windows\\System32\\win32u.dll",
+            L"C:\\Windows\\System32\\gdi32full.dll",
+            L"C:\\Windows\\System32\\kernelbase.dll"
+        };
+
+        dump_syscalls(dlls, "syscalls.dat");
+        std::cout << "Done.\n";
+    } catch (const std::exception& ex) {
+        std::cerr << "Error: " << ex.what() << '\n';
+    }
 
     return 0;
 }
